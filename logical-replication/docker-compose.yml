@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  main:
+    image: postgres:14.11
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - main:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -U postgres -h 127.0.0.1
+      interval: 10s
+
+  replica:
+    image: postgres:14.11
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - replica:/var/lib/postgresql/data
+    healthcheck:
+      test: pg_isready -U postgres -h 127.0.0.1
+      interval: 10s
+
+volumes:
+  main:
+  replica:
