@@ -1,0 +1,210 @@
+* Zero-downtime postgres migration via Logical Replication
+** Enable Logical Replication
+
+- docker compose down --volumes 
+- docker compose up
+- add test data to main server
+
+``` sql
+create database test_migration;
+
+\connect  test_migration;
+
+CREATE TABLE Persons (
+    Personid serial,
+    LastName varchar(255) NOT NULL,
+    FirstName varchar(255),
+    Age int,
+    PRIMARY KEY (Personid)
+); 
+
+insert into Persons (LastName, FirstName, Age) values ('Smith', 'Jonh', 20);
+insert into Persons (LastName, FirstName, Age) values ('Smith', 'Alex', 21);
+```
+
+- change wal_level
+
+``` sql
+ALTER SYSTEM SET wal_level = logical;
+SELECT pg_reload_conf();
+```
+
+- restart server
+
+``` sh
+docker compose stop
+docker compose up 
+```
+
+- check wal_level
+
+``` sql
+SHOW wal_level;
+```
+
+- Dump main server
+
+1. go to replica
+create database test_migration;
+pg_dump --schema-only postgres://postgres:postgres@main:5432/test_migration > dump.sql
+psql -U postgres -d test_migration < dump.sql 
+
+- Create publication on the main server
+  - CREATE PUBLICATION pub FOR ALL TABLES;
+  - select * from  pg_catalog.pg_publication;
+
+- Create subscription on the replica server
+
+``` sql
+CREATE SUBSCRIPTION sub 
+    CONNECTION 'host=main port=5432 user=postgres password=postgres dbname=test_migration'
+    PUBLICATION pub;
+```
+  - select * from  pg_catalog.pg_stat_subscription;
+  
+** Read-only replica
+
+- Disable write transactions:
+``` sql
+ALTER SYSTEM SET default_transaction_read_only TO on;
+SELECT pg_reload_conf();
+SHOW default_transaction_read_only;
+```
+
+** Switchover / failover
+- Do not write to both servers. It can corrupt the data.
+
+- Disable subscription on replica
+
+  #+begin_src sql
+DROP SUBSCRIPTION sub;
+  #+end_src
+
+- Copy sequences
+  - Problem
+
+    #+begin_src sql
+SELECT last_value FROM persons_personid_seq;
+--  last_value
+-- ------------
+--           1
+-- (1 row)
+
+insert into Persons (LastName, FirstName, Age) values ('Smith', 'Jonh', 20);
+
+-- ERROR:  duplicate key value violates unique constraint "persons_pkey"
+-- DETAIL:  Key (personid)=(1) already exists.
+    #+end_src
+
+  - Migration
+
+    #+begin_src sql
+pg_dump -t '*id_seq' postgres://postgres:postgres@main:5432/test_migration > dump-seq.sql
+psql -U postgres -d test_migration < dump-seq.sql
+    #+end_src
+
+    #+begin_src sql
+SELECT last_value FROM persons_personid_seq;
+--  last_value
+-- ------------
+--           2
+-- (1 row)
+
+insert into Persons (LastName, FirstName, Age) values ('Smith', 'Jonh', 20);
+-- INSERT 0 1
+    #+end_src
+
+- Recreate views/material views.
+
+- Drop publication on the main server
+
+  #+begin_src sql
+DROP PUBLICATION pub;
+  #+end_src
+
+** Problems with 2 active read/write servers (during rolling update)
+
+*** Rewrite updates on replica
+- update on the new server
+test_migration=# update Persons set age=21 where personid = 1;
+UPDATE 1
+
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+        1 | Smith    | Jonh      |  21
+(2 rows)
+
+- update on the old server
+test_migration=# update Persons set age=23 where personid = 1;
+UPDATE 1
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+        1 | Smith    | Jonh      |  23
+(2 rows)
+
+It rewrite previous value
+
+*** Lost update if record was deleted on the replica
+- delete on the old server
+delete from Persons where personid=1;
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+(1 row)
+
+- update on new server
+update Persons set age=22 where personid = 1;
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+        1 | Smith    | Jonh      |  22
+(2 rows)
+
+- select on new server
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+(1 row)
+
+*** Update wrong record
+- insert to the new server
+insert into Persons (LastName, FirstName, Age) values ('Red', 'Jonh', 20);
+
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+        1 | Red      | Jonh      |  20
+(2 rows)
+
+
+- update on the old server
+update Persons set age=22 where personid = 1;
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+        1 | Smith    | Jonh      |  22
+(2 rows)
+
+- show on the replica
+test_migration=# select * from Persons;
+ personid | lastname | firstname | age 
+----------+----------+-----------+-----
+        2 | Smith    | Alex      |  21
+        1 | Smith    | Jonh      |  22
+(2 rows)
+
+* Links
+- https://www.postgresql.org/docs/current/logical-replication-restrictions.html
+- https://knock.app/blog/zero-downtime-postgres-upgrades
+- https://www.sqlai.ai/posts/migrate-postgresql-database-using-logical-replication-and-downtime-close-to-zero
+- https://hevodata.com/learn/postgresql-logical-replication/
+
